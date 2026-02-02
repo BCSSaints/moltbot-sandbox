@@ -292,5 +292,695 @@ R2 is mounted via s3fs at `/data/moltbot`. Important gotchas:
 - **Mount checking**: Don't rely on `sandbox.mountBucket()` error messages to detect "already mounted" state. Instead, check `mount | grep s3fs` to verify the mount status.
 
 - **Never delete R2 data**: The mount directory `/data/moltbot` IS the R2 bucket. Running `rm -rf /data/moltbot/*` will DELETE your backup data. Always check mount status before any destructive operations.
+- 
+## Implementation Roadmap
+
+This section provides detailed guidance for implementing the 7 priority tasks identified in the Implementation Status section above.
+
+### Task 1: Improve WebSocket Support (Foundation)
+
+**Objective**: Make WebSocket connections reliable in local development and production environments.
+
+**Files to Modify**:
+- `src/index.ts` - Main worker handler
+- - `vitest.config.ts` - Test configuration
+  - - `src/routes/api.ts` - WebSocket endpoints
+   
+    - **Code Example: WebSocket Utility Layer**
+   
+    - Create `src/gateway/websocket-utils.ts`:
+   
+    - ```typescript
+      import { Hono } from 'hono';
+      import { upgradeWebSocket } from 'hono/cloudflare-workers';
+
+      export interface WebSocketMessage {
+        type: 'device-request' | 'device-response' | 'ping' | 'error';
+        payload: unknown;
+        timestamp: number;
+      }
+
+      export class WebSocketManager {
+        private connections: Map<string, WebSocket> = new Map();
+        private messageQueue: WebSocketMessage[] = [];
+        private reconnectAttempts = 0;
+        private maxReconnectAttempts = 5;
+
+        async connect(url: string, clientId: string): Promise<WebSocket> {
+          try {
+            const ws = new WebSocket(url);
+
+            ws.onopen = () => {
+              console.log(`WebSocket connected for client: ${clientId}`);
+              this.reconnectAttempts = 0;
+              this.flushMessageQueue();
+            };
+
+            ws.onmessage = (event) => {
+              this.handleMessage(event.data, clientId);
+            };
+
+            ws.onerror = (error) => {
+              console.error(`WebSocket error for ${clientId}:`, error);
+              this.handleError(clientId);
+            };
+
+            ws.onclose = () => {
+              console.log(`WebSocket closed for ${clientId}`);
+              this.connections.delete(clientId);
+              this.attemptReconnect(url, clientId);
+            };
+
+            this.connections.set(clientId, ws);
+            return ws;
+          } catch (error) {
+            console.error(`Failed to connect WebSocket for ${clientId}:`, error);
+            throw error;
+          }
+        }
+
+        private flushMessageQueue() {
+          while (this.messageQueue.length > 0) {
+            const msg = this.messageQueue.shift();
+            if (msg) {
+              this.broadcast(msg);
+            }
+          }
+        }
+
+        private attemptReconnect(url: string, clientId: string) {
+          if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+            console.log(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
+            setTimeout(() => this.connect(url, clientId), delay);
+          } else {
+            console.error(`Max reconnection attempts reached for ${clientId}`);
+          }
+        }
+
+        private handleMessage(data: string, clientId: string) {
+          try {
+            const message: WebSocketMessage = JSON.parse(data);
+            console.log(`Received message from ${clientId}:`, message.type);
+          } catch (error) {
+            console.error(`Failed to parse WebSocket message:`, error);
+          }
+        }
+
+        private handleError(clientId: string) {
+          // Implement error recovery logic
+        }
+
+        private broadcast(message: WebSocketMessage) {
+          for (const [clientId, ws] of this.connections) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(message));
+            }
+          }
+        }
+
+        send(clientId: string, message: WebSocketMessage) {
+          const ws = this.connections.get(clientId);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(message));
+          } else {
+            this.messageQueue.push(message);
+          }
+        }
+
+        close(clientId: string) {
+          const ws = this.connections.get(clientId);
+          if (ws) {
+            ws.close();
+            this.connections.delete(clientId);
+          }
+        }
+      }
+      ```
+
+      **Implementation Steps**:
+      1. Create the WebSocket utility layer above
+      2. 2. Add reconnection logic with exponential backoff
+         3. 3. Implement message queuing for when connection is down
+            4. 4. Update `src/index.ts` to use the new WebSocketManager
+               5. 5. Add configuration option `WEBSOCKET_TIMEOUT` to environment
+                  6. 6. Write tests in `src/gateway/websocket-utils.test.ts`
+                    
+                     7. **Testing**:
+                     8. - Test connection establishment
+                        - - Test message sending/receiving
+                          - - Test reconnection logic
+                            - - Test message queue behavior
+                             
+                              - ---
+
+                              ### Task 2: Complete E2E Testing (Depends on Task 1)
+
+                              **Objective**: Add comprehensive end-to-end tests for gateway startup, device pairing, and WebSocket communication.
+
+                              **Files to Create**:
+                              - `src/integration.test.ts` - Main integration test suite
+                              - - `src/routes/api.integration.test.ts` - API integration tests
+                                - - `src/client/integration.test.ts` - Client-side integration tests
+                                 
+                                  - **Code Template for `src/integration.test.ts`**:
+                                 
+                                  - ```typescript
+                                    import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+                                    import { createMockEnv, createMockSandbox } from './test-utils';
+                                    import type { MoltbotEnv } from './types';
+
+                                    describe('E2E: Gateway Startup and Device Pairing', () => {
+                                      let env: MoltbotEnv;
+
+                                      beforeEach(() => {
+                                        env = createMockEnv();
+                                      });
+
+                                      describe('Gateway Startup', () => {
+                                        it('should start the moltbot gateway process', async () => {
+                                          const { sandbox, startProcessMock } = createMockSandbox();
+                                          // Setup env with sandbox
+
+                                          // Assert gateway started
+                                          expect(startProcessMock).toHaveBeenCalledWith(
+                                            expect.objectContaining({
+                                              image: expect.stringContaining('moltbot'),
+                                            })
+                                          );
+                                        });
+
+                                        it('should handle gateway startup timeout gracefully', async () => {
+                                          // Test timeout handling
+                                        });
+
+                                        it('should recover from gateway crash', async () => {
+                                          // Test recovery logic
+                                        });
+                                      });
+
+                                      describe('Device Pairing Workflow', () => {
+                                        it('should show pending devices in admin UI', async () => {
+                                          // Test device listing
+                                        });
+
+                                        it('should approve a pending device', async () => {
+                                          // Test device approval
+                                        });
+
+                                        it('should reject a pending device', async () => {
+                                          // Test device rejection
+                                        });
+
+                                        it('should show paired devices list', async () => {
+                                          // Test paired devices retrieval
+                                        });
+                                      });
+
+                                      describe('WebSocket Communication', () => {
+                                        it('should establish WebSocket connection', async () => {
+                                          // Test WebSocket connection establishment
+                                        });
+
+                                        it('should send messages over WebSocket', async () => {
+                                          // Test message sending
+                                        });
+
+                                        it('should receive messages over WebSocket', async () => {
+                                          // Test message receiving
+                                        });
+
+                                        it('should handle WebSocket disconnection', async () => {
+                                          // Test disconnection handling
+                                        });
+
+                                        it('should reconnect after WebSocket failure', async () => {
+                                          // Test reconnection logic
+                                        });
+                                      });
+
+                                      describe('Control UI Integration', () => {
+                                        it('should serve Control UI on correct port', async () => {
+                                          // Test port configuration
+                                        });
+
+                                        it('should authenticate Control UI requests', async () => {
+                                          // Test authentication
+                                        });
+                                      });
+
+                                      describe('API Endpoints', () => {
+                                        it('GET /api/devices should list paired devices', async () => {
+                                          // Test device listing endpoint
+                                        });
+
+                                        it('POST /api/devices/approve should approve device', async () => {
+                                          // Test device approval endpoint
+                                        });
+
+                                        it('POST /api/gateway/restart should restart gateway', async () => {
+                                          // Test gateway restart endpoint
+                                        });
+                                      });
+                                    });
+                                    ```
+
+                                    **Implementation Checklist**:
+                                    - [ ] Create integration test file with comprehensive test cases
+                                    - [ ] - [ ] Implement fixtures for common test scenarios
+                                    - [ ] - [ ] Add test for gateway lifecycle (start, run, stop)
+                                    - [ ] - [ ] Add test for device pairing flow
+                                    - [ ] - [ ] Add test for WebSocket reliability
+                                    - [ ] - [ ] Add test for admin UI access control
+                                    - [ ] - [ ] Configure test timeouts for long-running processes
+                                    - [ ] - [ ] Add coverage reporting configuration
+                                    - [ ] - [ ] Document test running procedures
+                                   
+                                    - [ ] **Running Tests**:
+                                    - [ ] ```bash
+                                    - [ ] npm run test                    # Run all tests
+                                    - [ ] npm run test:watch            # Run tests in watch mode
+                                    - [ ] npm run test:coverage         # Generate coverage report
+                                    - [ ] npm run test -- integration   # Run integration tests only
+                                    - [ ] ```
+                                   
+                                    - [ ] ---
+                                   
+                                    - [ ] ### Task 3: Add Monitoring/Observability
+                                   
+                                    - [ ] **Objective**: Implement logging, health checks, and operational visibility.
+                                   
+                                    - [ ] **Files to Create**:
+                                    - [ ] - `src/monitoring/logger.ts` - Structured logging
+                                    - [ ] - `src/monitoring/health-check.ts` - Health check endpoints
+                                    - [ ] - `src/monitoring/metrics.ts` - Metrics collection
+                                    - [ ] - `src/routes/health.ts` - Health check routes
+                                   
+                                    - [ ] **Code Template for `src/monitoring/logger.ts`**:
+                                   
+                                    - [ ] ```typescript
+                                    - [ ] import { MoltbotEnv } from '../types';
+                                   
+                                    - [ ] export interface LogEntry {
+                                    - [ ]   timestamp: string;
+                                    - [ ]     level: 'debug' | 'info' | 'warn' | 'error';
+                                    - [ ]   service: string;
+                                    - [ ]     message: string;
+                                    - [ ]   metadata?: Record<string, unknown>;
+                                    - [ ]     traceId?: string;
+                                    - [ ] }
+                                   
+                                    - [ ] export class Logger {
+                                    - [ ]   constructor(private serviceName: string, private env: MoltbotEnv) {}
+                                   
+                                    - [ ]     private formatLog(entry: LogEntry): string {
+                                    - [ ]     return JSON.stringify(entry);
+                                    - [ ]   }
+                                   
+                                    - [ ]     debug(message: string, metadata?: Record<string, unknown>, traceId?: string) {
+                                    - [ ]     const entry: LogEntry = {
+                                    - [ ]       timestamp: new Date().toISOString(),
+                                    - [ ]         level: 'debug',
+                                    - [ ]           service: this.serviceName,
+                                    - [ ]             message,
+                                    - [ ]               metadata,
+                                    - [ ]                 traceId,
+                                    - [ ]                 };
+                                    - [ ]                 if (this.env.DEBUG_ROUTES) {
+                                    - [ ]                   console.log(this.formatLog(entry));
+                                    - [ ]                   }
+                                    - [ ]                 }
+                                   
+                                    - [ ]               info(message: string, metadata?: Record<string, unknown>, traceId?: string) {
+                                    - [ ]               const entry: LogEntry = {
+                                    - [ ]                 timestamp: new Date().toISOString(),
+                                    - [ ]                   level: 'info',
+                                    - [ ]                     service: this.serviceName,
+                                    - [ ]                       message,
+                                    - [ ]                         metadata,
+                                    - [ ]                           traceId,
+                                    - [ ]                           };
+                                    - [ ]                           console.log(this.formatLog(entry));
+                                    - [ ]                         }
+                                   
+                                    - [ ]                       warn(message: string, metadata?: Record<string, unknown>, traceId?: string) {
+                                    - [ ]                       const entry: LogEntry = {
+                                    - [ ]                         timestamp: new Date().toISOString(),
+                                    - [ ]                           level: 'warn',
+                                    - [ ]                             service: this.serviceName,
+                                    - [ ]                               message,
+                                    - [ ]                                 metadata,
+                                    - [ ]                                   traceId,
+                                    - [ ]                                   };
+                                    - [ ]                                   console.warn(this.formatLog(entry));
+                                    - [ ]                                 }
+                                   
+                                    - [ ]                               error(message: string, error?: Error, metadata?: Record<string, unknown>, traceId?: string) {
+                                    - [ ]                               const entry: LogEntry = {
+                                    - [ ]                                 timestamp: new Date().toISOString(),
+                                    - [ ]                                   level: 'error',
+                                    - [ ]                                     service: this.serviceName,
+                                    - [ ]                                       message,
+                                    - [ ]                                         metadata: {
+                                    - [ ]                                             ...metadata,
+                                    - [ ]                                                 error: error?.message,
+                                    - [ ]                                                     stack: error?.stack,
+                                    - [ ]                                                       },
+                                    - [ ]                                                         traceId,
+                                    - [ ]                                                         };
+                                    - [ ]                                                         console.error(this.formatLog(entry));
+                                    - [ ]                                                       }
+                                    - [ ]                                                   }
+                                    - [ ]                                               ```
+                                   
+                                    - [ ]                                           **Code Template for `src/monitoring/health-check.ts`**:
+                                   
+                                    - [ ]                                       ```typescript
+                                    - [ ]                                   import { MoltbotEnv } from '../types';
+                                   
+                                    - [ ]                               export interface HealthStatus {
+                                    - [ ]                             status: 'healthy' | 'degraded' | 'unhealthy';
+                                    - [ ]                           timestamp: string;
+                                    - [ ]                         checks: {
+                                    - [ ]                         gateway: 'up' | 'down';
+                                    - [ ]                         r2Storage: 'available' | 'unavailable';
+                                    - [ ]                         websocket: 'connected' | 'disconnected';
+                                    - [ ]                       };
+                                    - [ ]                     version: string;
+                                    - [ ]                   uptime: number;
+                                    - [ ]               }
+                                   
+                                    - [ ]           export async function checkHealth(env: MoltbotEnv): Promise<HealthStatus> {
+                                    - [ ]         const startTime = performance.now();
+                                   
+                                    - [ ]         // Check gateway status
+                                    - [ ]       let gatewayStatus: 'up' | 'down' = 'down';
+                                    - [ ]     try {
+                                    - [ ]     const processes = await env.Sandbox.listProcesses();
+                                    - [ ]     gatewayStatus = processes.some(p => p.name?.includes('moltbot')) ? 'up' : 'down';
+                                    - [ ]   } catch (error) {
+                                    - [ ]       gatewayStatus = 'down';
+                                    - [ ]     }
+                                   
+                                    - [ ]   // Check R2 storage
+                                    - [ ]     let r2Status: 'available' | 'unavailable' = 'unavailable';
+                                    - [ ]   if (env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY) {
+                                    - [ ]       r2Status = 'available';
+                                    - [ ]     }
+                                   
+                                    - [ ]   // Check WebSocket (simplified - actual check would connect to gateway)
+                                    - [ ]     let wsStatus: 'connected' | 'disconnected' = 'disconnected';
+                                    - [ ]   // Implementation depends on WebSocket manager
+                                   
+                                    - [ ]     const overallStatus = gatewayStatus === 'up' && wsStatus === 'connected'
+                                    - [ ]     ? 'healthy'
+                                    - [ ]     : gatewayStatus === 'up'
+                                    - [ ]     ? 'degraded'
+                                    - [ ]     : 'unhealthy';
+                                   
+                                    - [ ]   return {
+                                    - [ ]       status: overallStatus,
+                                    - [ ]       timestamp: new Date().toISOString(),
+                                    - [ ]       checks: {
+                                    - [ ]         gateway: gatewayStatus,
+                                    - [ ]           r2Storage: r2Status,
+                                    - [ ]             websocket: wsStatus,
+                                    - [ ]             },
+                                    - [ ]             version: '1.0.0',
+                                    - [ ]             uptime: performance.now() - startTime,
+                                    - [ ]           };
+                                    - [ ]       }
+                                    - [ ]   ```
+                                   
+                                    - [ ]   **Implementation Steps**:
+                                    - [ ]   1. Create logger utility with structured logging
+                                    - [ ]   2. Create health check system
+                                    - [ ]   3. Add health check endpoint at `GET /health`
+                                    - [ ]   4. Add metrics collection for key operations
+                                    - [ ]   5. Integrate logging throughout codebase
+                                    - [ ]   6. Add Grafana dashboard templates (optional)
+                                    - [ ]   7. Document observability best practices
+                                   
+                                    - [ ]   ---
+                                   
+                                    - [ ]   ### Task 4: Enhance R2 Sync Reliability
+                                   
+                                    - [ ]   **Objective**: Implement atomic sync operations and data consistency verification.
+                                   
+                                    - [ ]   **Files to Modify**:
+                                    - [ ]   - `src/gateway/r2.ts` - R2 mounting logic
+                                    - [ ]   - `src/gateway/sync.ts` - Sync logic
+                                   
+                                    - [ ]   **Code Template - Add to `src/gateway/r2.ts`**:
+                                   
+                                    - [ ]   ```typescript
+                                    - [ ]   export async function atomicR2Sync(
+                                    - [ ]     sandbox: Sandbox,
+                                    - [ ]   sourceDir: string,
+                                    - [ ]     bucketName: string,
+                                    - [ ]   env: MoltbotEnv
+                                    - [ ]   ): Promise<{success: boolean; timestamp: string; checksums: Record<string, string>}> {
+                                    - [ ]     const logger = new Logger('r2-sync', env);
+                                   
+                                    - [ ]     try {
+                                    - [ ]     // Step 1: Create temporary staging directory
+                                    - [ ]     const stagingDir = `${sourceDir}.staging`;
+                                    - [ ]     await sandbox.startProcess({
+                                    - [ ]       image: 'busybox',
+                                    - [ ]         args: ['mkdir', '-p', stagingDir],
+                                    - [ ]         });
+                                   
+                                    - [ ]         // Step 2: Copy files to staging with verification
+                                    - [ ]         const checksums: Record<string, string> = {};
+                                    - [ ]         await sandbox.startProcess({
+                                    - [ ]           image: 'alpine:latest',
+                                    - [ ]             args: ['sh', '-c', `find ${sourceDir} -type f -exec sha256sum {} \\; > ${stagingDir}/manifest.sha256`],
+                                    - [ ]             });
+                                   
+                                    - [ ]             // Step 3: Use rsync with proper flags for s3fs
+                                    - [ ]             const syncResult = await sandbox.startProcess({
+                                    - [ ]               image: 'rsync:latest',
+                                    - [ ]                 args: [
+                                    - [ ]                     'rsync',
+                                    - [ ]                         '-r',
+                                    - [ ]                             '--no-times',  // Critical: s3fs doesn't support timestamps
+                                    - [ ]                                 '--delete',
+                                    - [ ]                                     '--checksum',
+                                    - [ ]                                         `${stagingDir}/`,
+                                    - [ ]                                             `/data/moltbot/`,
+                                    - [ ]                                               ],
+                                    - [ ]                                               });
+                                   
+                                    - [ ]                                               if (syncResult.exitCode !== 0) {
+                                    - [ ]                                                 throw new Error(`Rsync failed with exit code ${syncResult.exitCode}`);
+                                    - [ ]                                                 }
+                                   
+                                    - [ ]                                                 // Step 4: Verify sync integrity
+                                    - [ ]                                                 const verifyResult = await sandbox.startProcess({
+                                    - [ ]                                                   image: 'alpine:latest',
+                                    - [ ]                                                     args: ['sh', '-c', `cd /data/moltbot && sha256sum -c ${stagingDir}/manifest.sha256`],
+                                    - [ ]                                                     });
+                                   
+                                    - [ ]                                                     if (verifyResult.exitCode !== 0) {
+                                    - [ ]                                                       throw new Error('Data integrity check failed after sync');
+                                    - [ ]                                                       }
+                                   
+                                    - [ ]                                                       // Step 5: Cleanup staging directory
+                                    - [ ]                                                       await sandbox.startProcess({
+                                    - [ ]                                                         image: 'busybox',
+                                    - [ ]                                                           args: ['rm', '-rf', stagingDir],
+                                    - [ ]                                                           });
+                                   
+                                    - [ ]                                                           logger.info('R2 sync completed successfully', { sourceDir, bucketName });
+                                   
+                                    - [ ]                                                           return {
+                                    - [ ]                                                             success: true,
+                                    - [ ]                                                               timestamp: new Date().toISOString(),
+                                    - [ ]                                                                 checksums,
+                                    - [ ]                                                                 };
+                                    - [ ]                                                               } catch (error) {
+                                    - [ ]                                                               logger.error('R2 sync failed', error as Error, { sourceDir, bucketName });
+                                    - [ ]                                                               throw error;
+                                    - [ ]                                                             }
+                                    - [ ]                                                         }
+                                   
+                                    - [ ]                                                     export async function verifyR2Mount(sandbox: Sandbox): Promise<boolean> {
+                                    - [ ]                                                   try {
+                                    - [ ]                                                   const result = await sandbox.startProcess({
+                                    - [ ]                                                     image: 'busybox',
+                                    - [ ]                                                       args: ['sh', '-c', 'mount | grep s3fs'],
+                                    - [ ]                                                       });
+                                   
+                                    - [ ]                                                           const { stdout } = await result.getLogs();
+                                    - [ ]                                                           return stdout.includes('s3fs on /data/moltbot');
+                                    - [ ]                                                         } catch (error) {
+                                    - [ ]                                                         return false;
+                                    - [ ]                                                       }
+                                    - [ ]                                                   }
+                                    - [ ]                                               ```
+                                   
+                                    - [ ]                                           **Implementation Steps**:
+                                    - [ ]                                       1. Implement atomic sync with staging directory
+                                    - [ ]                                   2. Add checksum-based verification
+                                    - [ ]                               3. Implement rollback mechanism for failed syncs
+                                    - [ ]                           4. Add R2 mount status monitoring
+                                    - [ ]                       5. Create sync failure alerts
+                                    - [ ]                   6. Document data safety procedures
+                                    - [ ]               7. Add backup retention policies
+                                   
+                                    - [ ]           ---
+                                   
+                                    - [ ]       ### Task 5: Performance Optimization
+                                   
+                                    - [ ]   **Objective**: Reduce cold start times and improve throughput.
+                                   
+                                    - [ ]   **Profiling Steps**:
+                                    - [ ]   ```bash
+                                    - [ ]   # Measure cold start time
+                                    - [ ]   time npm run deploy && time curl https://your-worker.workers.dev/health
+                                   
+                                    - [ ]   # Generate flame graph
+                                    - [ ]   node --prof src/index.ts
+                                    - [ ]   node --prof-process isolate-*.log > profile.txt
+                                    - [ ]   ```
+                                   
+                                    - [ ]   **Key Optimizations**:
+                                    - [ ]   1. **Container pre-warming**: Keep container alive longer
+                                    - [ ]   2. **Lazy loading**: Load skills only when needed
+                                    - [ ]   3. **Caching**: Cache compiled routes and configs
+                                    - [ ]   4. **Dependency reduction**: Minimize production dependencies
+                                    - [ ]   5. **Code splitting**: Split large modules
+                                    - [ ]   6. **Compression**: Gzip responses
+                                   
+                                    - [ ]   **Implementation Checklist**:
+                                    - [ ]   - [ ] Profile gateway startup time
+                                    - [ ]   - [ ] Optimize container lifecycle settings
+                                    - [ ]   - [ ] Implement skill lazy loading
+                                    - [ ]   - [ ] Add response compression
+                                    - [ ]   - [ ] Cache static assets
+                                    - [ ]   - [ ] Reduce bundle size
+                                    - [ ]   - [ ] Document performance benchmarks
+                                    - [ ]   - [ ] Set up performance monitoring
+                                   
+                                    - [ ]   ---
+                                   
+                                    - [ ]   ### Task 6: Additional Chat Platform Support
+                                   
+                                    - [ ]   **Objective**: Add Teams and WhatsApp integrations following the existing pattern.
+                                   
+                                    - [ ]   **Template for `src/channels/teams.ts`**:
+                                   
+                                    - [ ]   ```typescript
+                                    - [ ]   import { Logger } from '../monitoring/logger';
+                                    - [ ]   import { MoltbotEnv } from '../types';
+                                   
+                                    - [ ]   export class TeamsChannel {
+                                    - [ ]     private logger: Logger;
+                                   
+                                    - [ ]   constructor(private env: MoltbotEnv) {
+                                    - [ ]       this.logger = new Logger('teams-channel', env);
+                                    - [ ]     }
+                                   
+                                    - [ ]   async initialize(): Promise<void> {
+                                    - [ ]       if (!this.env.TEAMS_BOT_TOKEN) {
+                                    - [ ]         this.logger.warn('Teams bot token not configured');
+                                    - [ ]           return;
+                                    - [ ]           }
+                                    - [ ]           // Initialize Teams bot connection
+                                    - [ ]         }
+                                   
+                                    - [ ]       async sendMessage(userId: string, message: string): Promise<void> {
+                                    - [ ]       // Implement message sending to Teams
+                                    - [ ]     }
+                                   
+                                    - [ ]   async handleIncomingMessage(payload: unknown): Promise<void> {
+                                    - [ ]       // Implement incoming message handling
+                                    - [ ]     }
+                                   
+                                    - [ ]   async handleDevicePairing(userId: string, deviceId: string): Promise<void> {
+                                    - [ ]       // Implement device pairing flow for Teams
+                                    - [ ]     }
+                                    - [ ] }
+                                    - [ ] ```
+                                   
+                                    - [ ] **Implementation Steps**:
+                                    - [ ] 1. Create Teams channel module
+                                    - [ ] 2. Create WhatsApp channel module
+                                    - [ ] 3. Add environment variables for bot tokens
+                                    - [ ] 4. Implement message routing
+                                    - [ ] 5. Handle platform-specific features
+                                    - [ ] 6. Add error handling and logging
+                                    - [ ] 7. Write platform-specific tests
+                                    - [ ] 8. Document setup procedures
+                                   
+                                    - [ ] ---
+                                   
+                                    - [ ] ### Task 7: Upstream Updates
+                                   
+                                    - [ ] **Objective**: Track and document OpenClaw/Moltbot upstream changes.
+                                   
+                                    - [ ] **Create `docs/UPSTREAM_TRACKING.md`**:
+                                   
+                                    - [ ] ```markdown
+                                    - [ ] # Upstream Tracking
+                                   
+                                    - [ ] ## OpenClaw Project
+                                    - [ ] - **Repository**: https://github.com/openclaw/openclaw
+                                    - [ ] - **Current Version**: [Version from package.json]
+                                    - [ ] - **Last Checked**: [Date]
+                                   
+                                    - [ ] ## Notable Changes to Track
+                                   
+                                    - [ ] ### Naming Changes
+                                    - [ ] - Tool originally named: `clawdbot`
+                                    - [ ] - Renamed to: `openclaw` (in progress)
+                                    - [ ] - Internal references still use `clawdbot`
+                                    - [ ] - **Status**: Pending upstream merge
+                                   
+                                    - [ ] ### Package Changes
+                                    - [ ] - [@openclaw/cli](https://npmjs.org/@openclaw/cli) - Monitor for updates
+                                    - [ ] - [@openclaw/types](https://npmjs.org/@openclaw/types)
+                                   
+                                    - [ ] ## Migration Checklist
+                                    - [ ] - [ ] Update CLI tool references when upstream renames
+                                    - [ ] - [ ] Update config path references
+                                    - [ ] - [ ] Test compatibility with new versions
+                                    - [ ] - [ ] Document breaking changes
+                                    - [ ] - [ ] Update AGENTS.md with new patterns
+                                    - [ ] - [ ] Test E2E after upstream updates
+                                   
+                                    - [ ] ## Contribution Plan
+                                    - [ ] - Monitor OpenClaw issues and PRs
+                                    - [ ] - Contribute moltbot-sandbox insights back to project
+                                    - [ ] - Participate in design decisions
+                                    - [ ] - Test release candidates
+                                    - [ ] ```
+                                   
+                                    - [ ] **Implementation Steps**:
+                                    - [ ] 1. Create upstream tracking documentation
+                                    - [ ] 2. Set up dependency monitoring (Dependabot)
+                                    - [ ] 3. Create version compatibility matrix
+                                    - [ ] 4. Document migration paths
+                                    - [ ] 5. Plan major version updates
+                                    - [ ] 6. Communicate changes to team
+                                   
+                                    - [ ] ---
+                                   
+                                    - [ ] ## Summary
+                                   
+                                    - [ ] These 7 tasks form a complete roadmap for production-ready OpenClaw deployment on Cloudflare. Implementation should proceed in the order listed, with each task building on previous foundations.
+                                   
+                                    - [ ] **Estimated Timeline**:
+                                    - [ ] - Tasks 1-2: 2-3 weeks (core reliability)
+                                    - [ ] - Task 3: 1 week (observability)
+                                    - [ ] - Task 4: 1-2 weeks (data safety)
+                                    - [ ] - Task 5: 1 week (optimization)
+                                    - [ ] - Task 6-7: 1-2 weeks (expansion and maintenance)
+                                   
+                                    - [ ] **Total**: Approximately 6-9 weeks for full implementation with testing.
+                                   
+                                    - [ ] Each task includes production-ready code templates and detailed implementation steps that can be executed incrementally.
+                                    - [ ] 
 
 - **Process status**: The sandbox API's `proc.status` may not update immediately after a process completes. Instead of checking `proc.status === 'completed'`, verify success by checking for expected output (e.g., timestamp file exists after sync).
