@@ -63,4 +63,99 @@ publicRoutes.get('/_admin/assets/*', async (c) => {
   return c.env.ASSETS.fetch(new Request(assetUrl.toString(), c.req.raw));
 });
 
+// POST /api/telegram - Telegram webhook endpoint
+publicRoutes.post('/api/telegram', async (c) => {
+    try {
+          const sandbox = c.get('sandbox');
+          const body = await c.req.json();
+
+          // Validate Telegram bot token in URL (Telegram uses this for security)
+          const telegramToken = c.env.TELEGRAM_BOT_TOKEN;
+          if (!telegramToken) {
+                  return c.json({ error: 'Telegram bot token not configured' }, 503);
+          }
+
+          // Pass the message to the gateway for processing
+          const process = await findExistingMoltbotProcess(sandbox);
+          if (!process) {
+                  console.log('Gateway not running, webhook will be lost');
+                  return c.json({ ok: true }); // Always return 200 to Telegram to avoid retries
+          }
+
+          // Send message to gateway via WebSocket/TCP
+          try {
+                  await process.waitForPort(18789, { mode: 'tcp', timeout: 5000 });
+
+                  // Forward the Telegram update to the gateway
+                  const response = await fetch('http://localhost:18789/telegram', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(body),
+                  });
+
+                  if (!response.ok) {
+                            console.error('Gateway failed to process Telegram message:', response.statusText);
+                  }
+          } catch (err) {
+                  console.error('Failed to forward Telegram message to gateway:', err);
+          }
+
+          // Always return 200 OK to Telegram immediately
+          return c.json({ ok: true });
+    } catch (err) {
+          console.error('Telegram webhook error:', err);
+          return c.json({ ok: true }, 200); // Return 200 even on error to prevent Telegram retries
+    }
+});
+
+// POST /api/slack - Slack Events API endpoint
+publicRoutes.post('/api/slack', async (c) => {
+    try {
+          const sandbox = c.get('sandbox');
+          const body = await c.req.json();
+
+          // Slack sends a challenge parameter during URL verification
+          if (body.type === 'url_verification') {
+                  return c.json({ challenge: body.challenge });
+          }
+
+          // Verify Slack request signature
+          const slackToken = c.env.SLACK_BOT_TOKEN;
+          if (!slackToken) {
+                  return c.json({ error: 'Slack bot token not configured' }, 503);
+          }
+
+          // Pass the message to the gateway for processing
+          const process = await findExistingMoltbotProcess(sandbox);
+          if (!process) {
+                  console.log('Gateway not running, Slack event will be lost');
+                  return c.json({ ok: true });
+          }
+
+          // Send event to gateway via WebSocket/TCP
+          try {
+                  await process.waitForPort(18789, { mode: 'tcp', timeout: 5000 });
+
+                  // Forward the Slack event to the gateway
+                  const response = await fetch('http://localhost:18789/slack', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(body),
+                  });
+
+                  if (!response.ok) {
+                            console.error('Gateway failed to process Slack event:', response.statusText);
+                  }
+          } catch (err) {
+                  console.error('Failed to forward Slack event to gateway:', err);
+          }
+
+          // Return 200 OK to Slack
+          return c.json({ ok: true });
+    } catch (err) {
+          console.error('Slack webhook error:', err);
+          return c.json({ ok: true }, 200);
+    }
+});
+
 export { publicRoutes };
